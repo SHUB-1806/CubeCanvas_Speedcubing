@@ -11,7 +11,7 @@ class App(ctk.CTk):
         # Configure the main application window
         self.title("CubeCanvas")
         self.geometry("1000x600")
-        self.minsize(800, 500)
+        # self.minsize(800, 500)
 
         # Container frame that stores all application pages
         self.container = ctk.CTkFrame(self)

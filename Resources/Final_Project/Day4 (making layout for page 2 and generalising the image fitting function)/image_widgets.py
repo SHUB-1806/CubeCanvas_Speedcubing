@@ -50,7 +50,7 @@ def p2_main_area(app):
     # Main workspace containing the sidebar and image viewer
     app.main_area = ctk.CTkFrame(
         app.page2,
-        fg_color="yellow",
+        # fg_color="yellow",
     )
 
     app.main_area.grid(   #created main_area as 0th col and 1st row of page2 Frame

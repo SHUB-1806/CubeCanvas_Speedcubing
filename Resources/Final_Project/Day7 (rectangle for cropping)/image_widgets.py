@@ -77,7 +77,7 @@ def p2_topbar(app):
     # Generate an explicit mathematical indicator text block to split up row and column values visually on screen layout.
     ctk.CTkLabel(
         app.topbar,
-        text="×   Colums"
+        text="×   Columns"
     ).grid(
         row=0,
         column=2,
@@ -316,6 +316,9 @@ def p2_image_display(app):
         "<ButtonRelease-1>",
         app.finish_crop
     )
+
+    # Keep the Day 3 image-fitting feature when the window is resized.
+    app.image_panel.bind("<Configure>", app.update_image)
 
 
 def p1_open_button(app):
