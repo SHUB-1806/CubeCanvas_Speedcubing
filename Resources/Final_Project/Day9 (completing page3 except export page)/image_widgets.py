@@ -462,7 +462,7 @@ def p2_topbar(app):
 
     ctk.CTkLabel(
         app.topbar,
-        text="×   Colums"
+        text="×   Columns"
     ).grid(
         row=0,
         column=2,

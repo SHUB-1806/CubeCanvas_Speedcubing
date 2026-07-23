@@ -5,754 +5,364 @@ import math
 
 
 # ==========================================================
-# CONSTANTS
-# ==========================================================
-#
-# CELL:
-#   Size (in output PDF pixels) used to display one mosaic
-#   pixel/sticker. A larger value makes the instruction
-#   diagrams easier to read.
-#
-# CHUNK_SIZE:
-#   Maximum number of mosaic pixels processed per page.
-#
-#   Since one Rubik's Cube face is 3×3 stickers:
-#
-#       3 cubes × 3 stickers = 9 pixels
-#
-#   Therefore:
-#
-#       CHUNK_SIZE = 9
-#
-#   means one instruction page can contain at most a
-#   3×3 arrangement of Rubik's cubes.
-#
-# PAGE_SIZE:
-#   Size of the instruction pages generated.
-#
+# PDF EXPORT SETTINGS
 # ==========================================================
 
-CELL = 40
+PAGE_SIZE = (1200, 1200)
+PAGE_BG = (245, 247, 250)
+INK = (25, 28, 33)
+MUTED = (91, 101, 114)
+PANEL = (255, 255, 255)
+PANEL_BORDER = (190, 198, 210)
+ACCENT = (220, 38, 38)
+GRID_LINE = (122, 130, 142)
+CUBE_LINE = (18, 24, 32)
 CHUNK_SIZE = 9
-PAGE_SIZE = 900
+STICKERS_PER_CUBE = 3
 
-
-# ==========================================================
-# rgb_to_hex
-# ==========================================================
-#
-# Converts an RGB tuple into hexadecimal notation.
-#
-# Example:
-#
-#     (255, 0, 0)
-#
-# becomes:
-#
-#     "#ff0000"
-#
-# This function is not currently used in the PDF generation
-# pipeline, but it can be useful later if colors need to be
-# exported to HTML, JSON, text instructions, etc.
-#
-# ==========================================================
 
 def rgb_to_hex(rgb):
+    # Keep color names export-ready for any future HTML, CSV, or legend output.
+    return '#%02x%02x%02x' % tuple(rgb[:3])
 
-    return '#%02x%02x%02x' % tuple(rgb)
 
-# ==========================================================
-# create_overview_page
-# ==========================================================
-#
-# Creates the FIRST page of the PDF.
-#
-# This page serves as a map of the entire mosaic and shows
-# how the mosaic has been divided into printable chunks.
-#
-# Example:
-#
-# Suppose the mosaic dimensions are:
-#
-#       23 × 17 pixels
-#
-# Since each instruction page can contain at most:
-#
-#       9 × 9 pixels
-#
-# the mosaic is divided into:
-#
-#       ceil(23/9) = 3 chunks horizontally
-#       ceil(17/9) = 2 chunks vertically
-#
-# producing:
-#
-#       A1  B1  C1
-#       A2  B2  C2
-#
-# The final chunks may be smaller than 9×9 if the image
-# dimensions are not exact multiples of 9.
-#
-# This overview page visually communicates those divisions.
-#
-# ==========================================================
+def load_font(size, bold=False):
+    # Try common Windows fonts first because this project is a desktop Tk app.
+    font_names = (
+        ("arialbd.ttf", "Arial Bold.ttf") if bold else ("arial.ttf", "Arial.ttf")
+    )
+
+    for font_name in font_names:
+        try:
+            return ImageFont.truetype(font_name, size)
+        except OSError:
+            pass
+
+    # Pillow's built-in font keeps PDF export working on machines without Arial.
+    return ImageFont.load_default()
+
+
+def chunk_label(col, row):
+    # Convert 0-based columns into spreadsheet-style labels: A...Z, AA...AZ.
+    label = ""
+    col_number = col + 1
+
+    while col_number:
+        col_number, remainder = divmod(col_number - 1, 26)
+        label = chr(65 + remainder) + label
+
+    return f"{label}{row + 1}"
+
+
+def text_size(draw, text, font):
+    # textbbox gives exact dimensions and avoids deprecated textsize behavior.
+    left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
+    return right - left, bottom - top
+
+
+def fit_font_to_box(draw, text, start_size, max_w, max_h, bold=False, min_size=8):
+    # Shrink bounded text until it fits the available outline area.
+    for size in range(start_size, min_size - 1, -1):
+        font = load_font(size, bold=bold)
+        text_w, text_h = text_size(draw, text, font)
+
+        if text_w <= max_w and text_h <= max_h:
+            return font
+
+    # Returning None lets callers skip text that cannot be made readable safely.
+    return None
+
+
+def draw_text_fit(draw, box, text, size, fill=INK, bold=False, anchor="left", min_size=8):
+    # Draw one line only when it can be kept inside its assigned rectangle.
+    max_w = box[2] - box[0]
+    max_h = box[3] - box[1]
+    font = fit_font_to_box(draw, text, size, max_w, max_h, bold=bold, min_size=min_size)
+
+    if font is None:
+        return False
+
+    text_w, text_h = text_size(draw, text, font)
+    x = box[0] if anchor == "left" else box[0] + (max_w - text_w) / 2
+    y = box[1] + (max_h - text_h) / 2
+    draw.text((x, y), text, fill=fill, font=font)
+    return True
+
+
+def draw_panel(draw, box, title=None):
+    # A light panel groups each PDF feature without hiding the mosaic content.
+    draw.rounded_rectangle(box, radius=18, fill=PANEL, outline=PANEL_BORDER, width=2)
+
+    if title:
+        draw_text_fit(
+            draw,
+            (box[0] + 22, box[1] + 12, box[2] - 22, box[1] + 48),
+            title,
+            24,
+            bold=True,
+        )
+
+
+def fit_size(source_w, source_h, max_w, max_h, allow_upscale=True):
+    # Use one scale for both axes so every non-square mosaic keeps its aspect ratio.
+    if source_w <= 0 or source_h <= 0 or max_w <= 0 or max_h <= 0:
+        return 1, 1
+
+    scale = min(max_w / source_w, max_h / source_h)
+
+    if not allow_upscale:
+        scale = min(scale, 1)
+
+    return max(1, int(source_w * scale)), max(1, int(source_h * scale))
+
+
+def paste_fit(page, image, box, border=True):
+    # Resize a preview into the provided box instead of relying on fixed scales.
+    max_w = box[2] - box[0]
+    max_h = box[3] - box[1]
+    fitted_w, fitted_h = fit_size(image.width, image.height, max_w, max_h)
+    preview = image.resize((fitted_w, fitted_h), Image.Resampling.NEAREST)
+    x = box[0] + (max_w - fitted_w) // 2
+    y = box[1] + (max_h - fitted_h) // 2
+
+    page.paste(preview, (x, y))
+
+    if border:
+        ImageDraw.Draw(page).rectangle(
+            [x, y, x + fitted_w, y + fitted_h],
+            outline=PANEL_BORDER,
+            width=2,
+        )
+
+    return (x, y, fitted_w, fitted_h)
+
+
+def chunk_counts(image):
+    # Ceiling division includes partial right/bottom edge chunks in the plan.
+    return math.ceil(image.width / CHUNK_SIZE), math.ceil(image.height / CHUNK_SIZE)
+
+
+def chunk_bounds(image, col, row):
+    # Clamp every crop to the mosaic bounds so edge chunks can be smaller safely.
+    x1 = col * CHUNK_SIZE
+    y1 = row * CHUNK_SIZE
+    x2 = min(x1 + CHUNK_SIZE, image.width)
+    y2 = min(y1 + CHUNK_SIZE, image.height)
+    return x1, y1, x2, y2
+
+
+def draw_chunk_grid(draw, image, placed_box, current=None, show_labels=True):
+    # Draw chunk lines using pixel scale, not row/column averages; this fixes
+    # rectangular mosaics and final chunks that are narrower or shorter than 9.
+    x, y, displayed_w, displayed_h = placed_box
+    scale_x = displayed_w / image.width
+    scale_y = displayed_h / image.height
+    cols, rows = chunk_counts(image)
+    label_font = load_font(16, bold=True)
+
+    for row in range(rows):
+        for col in range(cols):
+            x1, y1, x2, y2 = chunk_bounds(image, col, row)
+            box = [
+                x + x1 * scale_x,
+                y + y1 * scale_y,
+                x + x2 * scale_x,
+                y + y2 * scale_y,
+            ]
+
+            is_current = current == (row, col)
+            outline = ACCENT if is_current else CUBE_LINE
+            width = 5 if is_current else 2
+            draw.rectangle(box, outline=outline, width=width)
+
+            if show_labels:
+                label = chunk_label(col, row)
+                label_box = [box[0] + 5, box[1] + 5, box[2] - 5, box[3] - 5]
+                label_font = fit_font_to_box(
+                    draw,
+                    label,
+                    16,
+                    label_box[2] - label_box[0] - 10,
+                    label_box[3] - label_box[1] - 8,
+                    bold=True,
+                    min_size=7,
+                )
+
+                if label_font:
+                    text_w, text_h = text_size(draw, label, label_font)
+                    tag = [
+                        label_box[0],
+                        label_box[1],
+                        min(label_box[0] + text_w + 10, label_box[2]),
+                        min(label_box[1] + text_h + 8, label_box[3]),
+                    ]
+                    draw.rounded_rectangle(tag, radius=5, fill=(255, 255, 255), outline=outline, width=1)
+                    draw_text_fit(draw, (tag[0] + 5, tag[1] + 2, tag[2] - 5, tag[3] - 2), label, 16, bold=True, min_size=7)
+
+
+def draw_color_palette(draw, image, box):
+    # Show the actual exported color set so the builder can audit available stickers.
+    colors = image.convert("RGB").getcolors(maxcolors=image.width * image.height)
+    colors = sorted(colors or [], key=lambda item: item[0], reverse=True)
+    total = max(1, image.width * image.height)
+    heading = load_font(22, bold=True)
+    font = load_font(17)
+    swatch = 28
+    gap = 10
+    x = box[0]
+    y = box[1]
+
+    draw.text((x, y), "Color key", fill=INK, font=heading)
+    y += 38
+
+    for index, (count, color) in enumerate(colors[:12], start=1):
+        if y + swatch > box[3]:
+            break
+
+        draw.rectangle([x, y, x + swatch, y + swatch], fill=color, outline=CUBE_LINE, width=1)
+        label = f"{index}. {rgb_to_hex(color)}  {count} stickers  ({count / total:.0%})"
+        draw_text_fit(draw, (x + swatch + gap, y, box[2], y + swatch), label, 17, fill=INK)
+        y += swatch + 11
+
+    if len(colors) > 12:
+        draw_text_fit(draw, (x, y, box[2], y + 28), f"+ {len(colors) - 12} more colors", 17, fill=MUTED)
+
 
 def create_overview_page(image):
-
-    #
-    # Create a blank page with a light gray background.
-    #
-    page = Image.new(
-        'RGB',
-        (1200, 1200),
-        (240, 240, 240)
-    )
-
+    # Build the PDF cover page as an explicit guide, not just a raw picture dump.
+    page = Image.new("RGB", PAGE_SIZE, PAGE_BG)
     draw = ImageDraw.Draw(page)
+    title_font = load_font(46, bold=True)
+    subtitle_font = load_font(22)
+    stat_font = load_font(20, bold=True)
+    cols, rows = chunk_counts(image)
+    cube_cols = math.ceil(image.width / STICKERS_PER_CUBE)
+    cube_rows = math.ceil(image.height / STICKERS_PER_CUBE)
 
-    #
-    # Create a large preview of the complete mosaic.
-    #
-    # NEAREST interpolation preserves the blocky appearance
-    # of the mosaic instead of blurring the colors.
-    #
-    OVERVIEW_SCALE = 10
-
-    preview_w = image.width * OVERVIEW_SCALE
-    preview_h = image.height * OVERVIEW_SCALE
-
-    preview = image.resize(
-        (preview_w, preview_h),
-        Image.Resampling.NEAREST
+    draw.text((50, 36), "CubeCanvas Build Guide", fill=INK, font=title_font)
+    draw.text(
+        (52, 92),
+        "Overview map, chunk order, color key, and one printable instruction page per chunk.",
+        fill=MUTED,
+        font=subtitle_font,
     )
 
-    offset_x = 50
-    offset_y = 50
+    stats = [
+        f"Mosaic: {image.width} x {image.height} stickers",
+        f"Chunks: {cols} x {rows} pages",
+        f"Cube faces: about {cube_cols} x {cube_rows}",
+        f"Chunk size: up to {CHUNK_SIZE} x {CHUNK_SIZE} stickers",
+    ]
 
-    page.paste(
-        preview,
-        (offset_x, offset_y)
-    )
+    for index, stat in enumerate(stats):
+        x = 52 + index * 280
+        stat_box = [x, 140, x + 250, 198]
+        draw.rounded_rectangle(stat_box, radius=14, fill=PANEL, outline=PANEL_BORDER, width=2)
+        draw_text_fit(draw, (stat_box[0] + 14, stat_box[1] + 10, stat_box[2] - 14, stat_box[3] - 10), stat, 20, bold=True)
 
-    #
-    # Determine how many instruction chunks are needed.
-    #
-    # ceil() is used because the last chunk may contain
-    # fewer than 9 pixels.
-    #
-    # Example:
-    #
-    #     width = 23 pixels
-    #
-    # gives:
-    #
-    #     ceil(23/9) = 3 chunks
-    #
-    cols = math.ceil(image.width / CHUNK_SIZE)
-    rows = math.ceil(image.height / CHUNK_SIZE)
+    map_panel = (50, 230, 810, 980)
+    side_panel = (840, 230, 1150, 980)
+    draw_panel(draw, map_panel, "Full mosaic map")
+    draw_panel(draw, side_panel, "Build details")
 
-    #
-    # Size of one chunk box on the overview image.
-    #
-    cell_w = preview_w / cols
-    cell_h = preview_h / rows
-    #
-    # Labels used for chunk identification.
-    #
-    # Columns:
-    #
-    #     A, B, C, ...
-    #
-    # Rows:
-    #
-    #     1, 2, 3, ...
-    #
-    letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+    placed = paste_fit(page, image, (80, 290, 780, 925))
+    draw_chunk_grid(draw, image, placed, show_labels=True)
 
-    font = ImageFont.truetype(
-        'arial.ttf',
-        25
-    )
+    draw_color_palette(draw, image, (870, 290, 1120, 930))
 
-    #
-    # Draw chunk boundaries and labels.
-    #
-    for row in range(rows):
-
-        for col in range(cols):
-
-            #
-            # Determine actual chunk dimensions.
-            #
-            # Most chunks are 9×9 pixels.
-            #
-            # Edge chunks may be smaller.
-            #
-            actual_w = min(
-                CHUNK_SIZE,
-                image.width - col * CHUNK_SIZE
-            )
-
-            actual_h = min(
-                CHUNK_SIZE,
-                image.height - row * CHUNK_SIZE
-            )
-
-            #
-            # Position of this chunk on the overview page.
-            #
-            x = offset_x + col * cell_w
-            y = offset_y + row * cell_h
-
-            #
-            # Scale edge chunks proportionally.
-            #
-            # Example:
-            #
-            # If only 5 pixels remain horizontally,
-            # the box occupies 5/9 of the normal width.
-            #
-            x2 = x + cell_w * actual_w / CHUNK_SIZE
-            y2 = y + cell_h * actual_h / CHUNK_SIZE
-
-            #
-            # Draw chunk boundary.
-            #
-            draw.rectangle(
-                [x, y, x2, y2],
-                outline='black',
-                width=3
-            )
-
-            #
-            # Generate chunk label.
-            #
-            # Examples:
-            #
-            #     col=0,row=0 → A1
-            #     col=1,row=0 → B1
-            #     col=0,row=1 → A2
-            #
-            label = f'{letters[col]}{row+1}'
-
-            #
-            # Draw label inside the chunk.
-            #
-            draw.text(
-                (x + 10, y + 10),
-                label,
-                fill='black',
-                font=font
-            )
-
-    #
-    # Return the completed overview page.
-    #
     return page
 
 
-# ==========================================================
-# create_page
-# ==========================================================
-#
-# Generates one instruction page corresponding to a single
-# chunk of the mosaic.
-#
-# Layout of the page:
-#
-# ┌───────────────────────────────────────────────┐
-# │ Chunk Preview     Label          Mini Map     │
-# │                                               │
-# │                                               │
-# │                                               │
-# │      Enlarged Chunk Instructions              │
-# │                                               │
-# │  Thick lines every 3 stickers indicate        │
-# │  Rubik's Cube boundaries.                     │
-# └───────────────────────────────────────────────┘
-#
-# Inputs:
-#
-# chunk:
-#     Cropped portion of the mosaic.
-#
-# label:
-#     Chunk identifier (A1, B2, C3, ...)
-#
-# full_image:
-#     Entire mosaic image.
-#
-# row, col:
-#     Chunk location within the mosaic.
-#
-# ==========================================================
+def draw_instruction_grid(draw, chunk, box):
+    # Choose the largest sticker size that fits both width and height.
+    available_w = box[2] - box[0]
+    available_h = box[3] - box[1]
+    cell = max(18, min(available_w // chunk.width, available_h // chunk.height))
+    grid_w = cell * chunk.width
+    grid_h = cell * chunk.height
+    start_x = box[0] + (available_w - grid_w) // 2
+    start_y = box[1] + (available_h - grid_h) // 2
+    pixels = chunk.convert("RGB").load()
+
+    for py in range(chunk.height):
+        for px in range(chunk.width):
+            x1 = start_x + px * cell
+            y1 = start_y + py * cell
+            draw.rectangle(
+                [x1, y1, x1 + cell, y1 + cell],
+                fill=pixels[px, py],
+                outline=GRID_LINE,
+                width=1,
+            )
+
+    for py in range(0, chunk.height + 1, STICKERS_PER_CUBE):
+        y = start_y + py * cell
+        draw.line([(start_x, y), (start_x + grid_w, y)], fill=CUBE_LINE, width=5)
+
+    for px in range(0, chunk.width + 1, STICKERS_PER_CUBE):
+        x = start_x + px * cell
+        draw.line([(x, start_y), (x, start_y + grid_h)], fill=CUBE_LINE, width=5)
+
+    draw.rectangle([start_x, start_y, start_x + grid_w, start_y + grid_h], outline=CUBE_LINE, width=6)
+
+    return cell
+
 
 def create_page(chunk, label, full_image, row, col):
-
-    #
-    # Create blank instruction page.
-    #
-    page = Image.new(
-        'RGB',
-        (900, 900),
-        (240, 240, 240)
-    )
-
+    # Build one printable instruction page for a single mosaic chunk.
+    page = Image.new("RGB", PAGE_SIZE, PAGE_BG)
     draw = ImageDraw.Draw(page)
+    title_font = load_font(78, bold=True)
+    meta_font = load_font(22)
+    cols, rows = chunk_counts(full_image)
 
-    letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
-
-    # ======================================================
-    # Mini overview map
-    # ======================================================
-    #
-    # This shows the complete mosaic in the corner.
-    # The current chunk is highlighted in red so the
-    # builder knows where they are.
-    #
-    MINIMAP_SCALE = 5
-
-    overview_w = full_image.width * MINIMAP_SCALE
-    overview_h = full_image.height * MINIMAP_SCALE
-
-    overview = full_image.resize(
-        (overview_w, overview_h),
-        Image.Resampling.NEAREST
-    )
-
-    overview_x = 620
-    overview_y = 20
-
-    page.paste(
-        overview,
-        (overview_x, overview_y)
-    )
-
-    #
-    # Number of chunks in the mosaic.
-    #
-    cols = math.ceil(full_image.width / CHUNK_SIZE)
-    rows = math.ceil(full_image.height / CHUNK_SIZE)
-
-    cell_w = overview_w / cols
-    cell_h = overview_h / rows
-
-    font_small = ImageFont.truetype(
-        'arial.ttf',
-        18
-    )
-
-    #
-    # Draw chunk boundaries on the mini map.
-    #
-    for r in range(rows):
-
-        for c in range(cols):
-
-            #
-            # Edge chunks may be smaller.
-            #
-            actual_w = min(
-                CHUNK_SIZE,
-                full_image.width - c * CHUNK_SIZE
-            )
-
-            actual_h = min(
-                CHUNK_SIZE,
-                full_image.height - r * CHUNK_SIZE
-            )
-
-            x = overview_x + c * cell_w
-            y = overview_y + r * cell_h
-
-            x2 = x + cell_w * actual_w / CHUNK_SIZE
-            y2 = y + cell_h * actual_h / CHUNK_SIZE
-
-            #
-            # Highlight current chunk.
-            #
-            if r == row and c == col:
-                outline = 'red'
-                width = 5
-            else:
-                outline = 'black'
-                width = 2
-
-            draw.rectangle(
-                [x, y, x2, y2],
-                outline=outline,
-                width=width
-            )
-
-            #
-            # Draw chunk label.
-            #
-            label_text = f'{letters[c]}{r+1}'
-
-            draw.text(
-                (x + 5, y + 5),
-                label_text,
-                fill='black',
-                font=font_small
-            )
-
-    # ======================================================
-    # Chunk preview
-    # ======================================================
-    #
-    # Shows the actual chunk at a glance.
-    #
-    PREVIEW_SCALE = 20
-
-    preview = chunk.resize(
-        (
-            chunk.width * PREVIEW_SCALE,
-            chunk.height * PREVIEW_SCALE
-        ),
-        Image.Resampling.NEAREST
-    )
-
-    page.paste(preview, (20, 20))
-
-    # ======================================================
-    # Large chunk label
-    # ======================================================
-    #
-    # Makes it easy to identify pages after printing.
-    #
-    font_large = ImageFont.truetype(
-        'arial.ttf',
-        180
-    )
-
+    draw.text((50, 34), f"Chunk {label}", fill=INK, font=title_font)
     draw.text(
-        (250, 0),
-        label,
-        fill='black',
-        font=font_large
+        (55, 122),
+        f"Page position: row {row + 1} of {rows}, column {col + 1} of {cols} | "
+        f"Chunk size: {chunk.width} x {chunk.height} stickers",
+        fill=MUTED,
+        font=meta_font,
     )
 
-    # ======================================================
-    # Enlarged instruction diagram
-    # ======================================================
-    #
-    # Each mosaic pixel becomes a large square.
-    #
-    start_x = 20
-    start_y = 220
+    preview_panel = (50, 180, 395, 475)
+    map_panel = (425, 180, 1150, 475)
+    grid_panel = (50, 510, 1150, 1135)
 
-    pixels = chunk.load()
+    draw_panel(draw, preview_panel, "This chunk")
+    draw_panel(draw, map_panel, "Where it goes")
+    draw_panel(draw, grid_panel, "Sticker grid")
 
-    chunk_w = chunk.width
-    chunk_h = chunk.height
+    paste_fit(page, chunk, (80, 240, 365, 445))
 
-    # ======================================================
-    # Draw individual stickers
-    # ======================================================
-    #
-    # Every mosaic pixel becomes one enlarged sticker.
-    #
-    for py in range(chunk_h):
+    placed = paste_fit(page, full_image, (455, 240, 1120, 445))
+    draw_chunk_grid(draw, full_image, placed, current=(row, col), show_labels=True)
 
-        for px in range(chunk_w):
+    draw_instruction_grid(draw, chunk, (85, 575, 1115, 1085))
 
-            color = tuple(
-                pixels[px, py]
-            )
-
-            #
-            # Convert mosaic coordinates into
-            # page coordinates.
-            #
-            x1 = start_x + px * CELL
-            y1 = start_y + py * CELL
-
-            x2 = x1 + CELL
-            y2 = y1 + CELL
-
-            #
-            # Draw sticker.
-            #
-            draw.rectangle(
-                [x1, y1, x2, y2],
-                fill=color,
-                outline='gray',
-                width=1
-            )
-
-    # ======================================================
-    # Draw Rubik's Cube boundaries
-    # ======================================================
-    #
-    # Every 3 stickers correspond to one cube face.
-    #
-    # Sticker grid:
-    #
-    #     □ □ □ | □ □ □ | □ □ □
-    #     □ □ □ | □ □ □ | □ □ □
-    #     □ □ □ | □ □ □ | □ □ □
-    #     -------+-------+------
-    #
-    # Thick lines visually separate cubes.
-    #
-    for py in range(0, chunk_h + 1, 3):
-
-        y = start_y + py * CELL
-
-        draw.line(
-            [
-                (start_x, y),
-                (start_x + chunk_w * CELL, y)
-            ],
-            fill='black',
-            width=5
-        )
-
-    for px in range(0, chunk_w + 1, 3):
-
-        x = start_x + px * CELL
-
-        draw.line(
-            [
-                (x, start_y),
-                (x, start_y + chunk_h * CELL)
-            ],
-            fill='black',
-            width=5
-        )
-
-    # ======================================================
-    # Outer border
-    # ======================================================
-    #
-    # Gives the entire instruction area a clear edge.
-    #
-    draw.rectangle(
-        [
-            start_x,
-            start_y,
-            start_x + chunk_w * CELL,
-            start_y + chunk_h * CELL
-        ],
-        outline='black',
-        width=6
-    )
-
-    #
-    # Return completed page.
-    #
     return page
 
 
-# ==========================================================
-# export_pdf
-# ==========================================================
-#
-# Main PDF generation function.
-#
-# Workflow:
-#
-#     Input Mosaic
-#           │
-#           ▼
-#   Create Overview Page
-#           │
-#           ▼
-#   Divide Mosaic Into Chunks
-#           │
-#           ▼
-#   Generate One Page Per Chunk
-#           │
-#           ▼
-#      Return All Pages
-#
-#
-# Example:
-#
-# Suppose the mosaic size is:
-#
-#       width  = 23 pixels
-#       height = 17 pixels
-#
-# Since each instruction chunk can contain:
-#
-#       9 × 9 pixels maximum
-#
-# we need:
-#
-#       ceil(23 / 9) = 3 chunks horizontally
-#       ceil(17 / 9) = 2 chunks vertically
-#
-# giving:
-#
-#       A1  B1  C1
-#       A2  B2  C2
-#
-# The last chunks automatically become smaller:
-#
-#       C1 → 5 × 9
-#       A2 → 9 × 8
-#       B2 → 9 × 8
-#       C2 → 5 × 8
-#
-# ==========================================================
-
 def export_pdf(image):
+    # Normalize to RGB so every PDF page can be saved without mode-specific errors.
+    image = image.convert("RGB")
+    chunk_cols, chunk_rows = chunk_counts(image)
+    pages = [create_overview_page(image)]
 
-    #
-    # Determine how many chunks are required.
-    #
-    # ceil() is important here.
-    #
-    # Example:
-    #
-    #     width = 23
-    #
-    #     23 / 9 = 2.55...
-    #
-    # We still need the third chunk to store the
-    # remaining 5 pixels.
-    #
-    chunk_cols = math.ceil(
-        image.width / CHUNK_SIZE
-    )
-
-    chunk_rows = math.ceil(
-        image.height / CHUNK_SIZE
-    )
-
-    #
-    # List that will store all generated pages.
-    #
-    # The final PDF will simply be these pages
-    # stitched together in order.
-    #
-    pages = []
-
-    # ======================================================
-    # Generate overview page
-    # ======================================================
-    #
-    # This becomes Page 1 of the PDF.
-    #
-    overview_page = create_overview_page(
-        image
-    )
-
-    pages.append(
-        overview_page
-    )
-
-    #
-    # Column labels.
-    #
-    # Examples:
-    #
-    #     col = 0 → A
-    #     col = 1 → B
-    #     col = 2 → C
-    #
-    letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
-
-    # ======================================================
-    # Generate chunk instruction pages
-    # ======================================================
-    #
-    # Chunks are processed row by row.
-    #
-    # Example:
-    #
-    #       A1 → B1 → C1
-    #       A2 → B2 → C2
-    #
-    # This ordering makes assembly easier.
-    #
     for row in range(chunk_rows):
-
         for col in range(chunk_cols):
+            x1, y1, x2, y2 = chunk_bounds(image, col, row)
+            chunk = image.crop((x1, y1, x2, y2))
+            label = chunk_label(col, row)
 
-            #
-            # Compute top-left corner of chunk
-            # in mosaic coordinates.
-            #
-            x1 = col * CHUNK_SIZE
-            y1 = row * CHUNK_SIZE
-
-            #
-            # Compute bottom-right corner.
-            #
-            # Edge chunks may extend beyond the
-            # mosaic dimensions, so min() keeps
-            # them inside the image.
-            #
-            x2 = min(
-                x1 + CHUNK_SIZE,
-                image.width
-            )
-
-            y2 = min(
-                y1 + CHUNK_SIZE,
-                image.height
-            )
-
-            #
-            # Extract chunk from the mosaic.
-            #
-            # Examples:
-            #
-            # Normal chunk:
-            #
-            #     (0,0) → (9,9)
-            #
-            # Edge chunk:
-            #
-            #     (18,0) → (23,9)
-            #
-            # producing a 5×9 chunk.
-            #
-            chunk = image.crop(
-                (
-                    x1,
-                    y1,
-                    x2,
-                    y2
+            pages.append(
+                create_page(
+                    chunk=chunk,
+                    label=label,
+                    full_image=image,
+                    row=row,
+                    col=col,
                 )
             )
 
-            #
-            # Generate chunk label.
-            #
-            # Examples:
-            #
-            #     row=0,col=0 → A1
-            #     row=0,col=1 → B1
-            #     row=1,col=0 → A2
-            #
-            label = (
-                f'{letters[col]}{row + 1}'
-            )
-
-            #
-            # Generate instruction page for
-            # this chunk.
-            #
-            page = create_page(
-                chunk=chunk,
-                label=label,
-                full_image=image,
-                row=row,
-                col=col
-            )
-
-            #
-            # Add page to PDF sequence.
-            #
-            pages.append(page)
-
-    #
-    # Return all pages.
-    #
-    # The caller can save them directly as a PDF.
-    #
     return pages
-

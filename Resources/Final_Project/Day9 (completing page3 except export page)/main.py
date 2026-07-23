@@ -127,6 +127,11 @@ class App(ctk.CTk):
         # Clear all existing drawing items from the canvas before rendering the newly updated image.
         canvas.delete("all")
 
+        # A resize changes the canvas-to-image coordinate mapping, so an old
+        # crop rectangle must not be confirmed with stale coordinates.
+        self.crop_rect = None
+        self.crop_display_coords = None
+
         # Store the computed visual display dimensions to bound cursor tracking limits later in the code.
         self.display_width = new_width
         self.display_height = new_height
@@ -265,7 +270,8 @@ class App(ctk.CTk):
                 return None
 
             # Divide structural grid rows by columns to produce the exact decimal scaling aspect coefficient factor.
-            return rows / cols
+            # Image aspect ratio is width / height: columns / rows.
+            return cols / rows
 
         # Handle formatting data conversion anomalies gracefully by returning empty object states to workflows.
         except ValueError:
